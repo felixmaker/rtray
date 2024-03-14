@@ -1,0 +1,6 @@
+[workspace]
+members = [
+	"rtray",
+	"rtray-sys",
+]
+resolver = "2"
