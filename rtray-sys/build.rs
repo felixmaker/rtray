@@ -4,10 +4,9 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=wrapper.c");
-    println!("cargo:rerun-if-changed=tray/tray.h");
+    println!("cargo:rerun-if-changed=src/tray.h");
 
-    let define = match target_os.as_str() {
+    let target_macro = match target_os.as_str() {
         "windows" => "TRAY_WINAPI",
         "linux" => "TRAY_APPINDICATOR",
         "macos" => "TRAY_APPKIT",
@@ -15,8 +14,8 @@ fn main() {
     };
 
     cc::Build::new()
-        .define(define, "1")
-        .file("wrapper.c")
+        .define(target_macro, "1")
+        .file(concat!("src/wrapper.c"))
         .compile("tray");
 
     match target_os.as_str() {

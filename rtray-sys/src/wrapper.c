@@ -1,4 +1,4 @@
-#include "tray/tray.h"
+#include "tray.h"
 
 // Static wrappers
 
