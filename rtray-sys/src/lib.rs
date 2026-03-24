@@ -6,3 +6,5 @@
 #![allow(non_upper_case_globals)]
 
 pub mod tray;
+
+pub use tray::*;
