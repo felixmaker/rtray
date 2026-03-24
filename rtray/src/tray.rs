@@ -1,122 +1,242 @@
-use std::ffi::{c_char, c_void, CString};
+use std::{
+    cell::RefCell,
+    ffi::{c_char, c_void, CStr, CString},
+    rc::Rc,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
-use rtray_sys::tray::{tray, tray_menu};
+use rtray_sys::{CTray, CTrayMenu};
 
-fn tray_menu_null() -> tray_menu {
-    tray_menu {
-        text: std::ptr::null_mut(),
-        disabled: 0,
-        checked: 0,
-        cb: None,
-        context: std::ptr::null_mut(),
-        submenu: std::ptr::null_mut(),
-    }
-}
-
-fn tray_menu_vec_into_raw(menu: &[TrayMenu]) -> *mut tray_menu {
-    let menu = menu.to_vec();
-    let mut menu: Vec<tray_menu> = menu.iter().map(|x| x.inner.clone()).collect();
-    if menu.len() > 0 {
-        menu.push(tray_menu_null());
-        let mut menu = std::mem::ManuallyDrop::new(menu);
-        menu.as_mut_ptr()
-    } else {
-        std::ptr::null_mut()
-    }
-}
-
-fn cstring_into_raw(s: &str) -> *mut c_char {
-    let s = match CString::new(s) {
-        Ok(v) => v,
-        Err(r) => {
-            let i = r.nul_position();
-            CString::new(&r.into_vec()[0..i]).unwrap()
-        }
-    };
-    s.into_raw()
-}
+static TRAY: AtomicPtr<TrayInner> = AtomicPtr::new(std::ptr::null_mut());
 
 /// A tray with an icon and a menu
 ///
 /// Bindings to struct tray
-#[derive(Debug, Clone)]
 pub struct Tray {
-    inner: tray,
+    inner: *mut TrayInner,
 }
 
 impl Tray {
     /// Returns a tray with an icon and a menu.
-    pub fn new(icon: &str, menu: &[TrayMenu]) -> Self {
-        let inner = tray {
-            icon: cstring_into_raw(icon),
-            menu: tray_menu_vec_into_raw(menu),
+    ///
+    /// # Panics
+    ///
+    /// If one tray is already created.
+    pub fn new<T>(icon: &str, menus: T) -> Self
+    where
+        T: Into<Vec<TrayMenu>>,
+    {
+        if TRAY.load(Ordering::Relaxed) != std::ptr::null_mut() {
+            panic!("tray already created");
+        }
+        Self {
+            inner: TrayInner::new(icon, menus) as *mut _,
+        }
+    }
+
+    /// Updates tray icon and menu.
+    pub fn update(&mut self) {
+        unsafe {
+            let tray = &mut *self.inner;
+            rtray_sys::tray::tray_update(&mut tray.inner as *mut CTray); //TODO
+        }
+    }
+}
+
+impl Drop for Tray {
+    fn drop(&mut self) {
+        unsafe {
+            if let Ok(_) = TRAY.compare_exchange(
+                self.inner,
+                std::ptr::null_mut(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                let _ = Box::from_raw(self.inner);
+            }
+        }
+    }
+}
+
+#[repr(C)]
+pub(crate) struct TrayInner {
+    inner: CTray,
+    menu: Box<[TrayMenu]>,
+}
+
+impl TrayInner {
+    pub fn new<T>(icon: &str, menus: T) -> &'static mut Self
+    where
+        T: Into<Vec<TrayMenu>>,
+    {
+        let icon = CString::new(icon).unwrap();
+        let mut menu: Vec<TrayMenu> = menus.into();
+        menu.push(TrayMenu::null()); // Tray menu is null terminated.
+
+        let mut menu = menu.into_boxed_slice();
+
+        let inner = CTray {
+            icon: icon.into_raw(),
+            menu: menu.as_mut_ptr() as *mut CTrayMenu,
         };
-        Self { inner }
+
+        let tray = Self { inner, menu };
+        let tray = Box::into_raw(Box::new(tray));
+        TRAY.store(tray, Ordering::Relaxed);
+        let tray = unsafe { &mut *TRAY.load(Ordering::Relaxed) };
+        unsafe {
+            rtray_sys::tray_init(&mut tray.inner);
+        }
+
+        tray
+    }
+}
+
+impl Drop for TrayInner {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Box::from_raw(self.inner.icon);
+        }
+    }
+}
+
+#[repr(C)]
+// #[derive(Clone)]
+struct TrayMenuContext {
+    callback: Option<Box<dyn FnMut(&mut Tray, &mut TrayMenu)>>,
+    submenu: Box<[TrayMenu]>,
+    text: CString,
+}
+
+impl TrayMenuContext {
+    fn new<I, T>(text: &str, callback: I, submenu: T) -> Self
+    where
+        I: FnMut(&mut Tray, &mut TrayMenu) + 'static,
+        T: Into<Vec<TrayMenu>>,
+    {
+        let mut submenu: Vec<TrayMenu> = submenu.into();
+        submenu.push(TrayMenu::null()); // Tray submenu is null terminated.
+        Self {
+            callback: Some(Box::new(callback)),
+            submenu: submenu.into_boxed_slice(),
+            text: CString::new(text).unwrap(),
+        }
     }
 }
 
 /// A menu with menu text, menu checked and disabled (grayed) flags and a callback
 ///
 /// Bindings to struct tray_menu
-#[derive(Debug, Clone)]
+#[repr(transparent)]
 pub struct TrayMenu {
-    inner: tray_menu,
+    inner: CTrayMenu,
+}
+
+impl Clone for TrayMenu {
+    fn clone(&self) -> Self {
+        if !self.inner.context.is_null() {
+            unsafe {
+                Rc::increment_strong_count(self.inner.context as *const RefCell<TrayMenuContext>);
+            }
+        }
+        Self {
+            inner: CTrayMenu { ..self.inner },
+        }
+    }
+}
+
+extern "C" fn shim(menu: *mut CTrayMenu) {
+    let menu = unsafe { &mut *(menu as *mut TrayMenu) };
+    let tray = unsafe { std::mem::transmute(&mut TRAY.load(Ordering::Relaxed)) };
+    let context = unsafe { &*(menu.inner.context as *const RefCell<TrayMenuContext>) };
+    if let Some(callback) = &mut context.borrow_mut().callback {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(tray, menu)));
+    }
 }
 
 impl TrayMenu {
     /// Returns a menu with menu text, menu checked and disabled (grayed) flags and a callback.
-    pub fn new_ex<F: FnMut(&mut Self) + 'static>(
-        text: &str,
-        disabled: bool,
-        checked: bool,
-        cb: F,
-        submenu: &[TrayMenu],
-    ) -> Self {
-        let text = cstring_into_raw(text);
-        let submenu = tray_menu_vec_into_raw(submenu);
+    pub fn new_ex<T, F>(text: &str, disabled: bool, checked: bool, callback: F, submenu: T) -> Self
+    where
+        T: Into<Vec<TrayMenu>>,
+        F: FnMut(&mut Tray, &mut TrayMenu) + 'static,
+    {
+        let context = Rc::new(RefCell::new(TrayMenuContext::new(text, callback, submenu)));
+        let submenu = if context.borrow().submenu.len() == 1 {
+            std::ptr::null_mut()
+        } else {
+            context.borrow().submenu.as_ptr() as *mut CTrayMenu
+        };
+        let text = context.borrow().text.as_ptr() as *mut c_char;
+        let context: *const RefCell<TrayMenuContext> = Rc::into_raw(context);
 
-        unsafe extern "C" fn shim(menu: *mut tray_menu) {
-            let mut menu = TrayMenu { inner: *menu };
-
-            let a = menu.inner.context as *mut Box<dyn FnMut(&mut TrayMenu)>;
-            let f = &mut **a;
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut menu)));
-        }
-
-        let a: *mut Box<dyn FnMut(&mut Self)> = Box::into_raw(Box::new(Box::new(cb)));
-
-        let inner = tray_menu {
-            text,
-            disabled: disabled as i32,
-            checked: checked as i32,
-            cb: Some(shim),
-            context: a as *mut c_void,
-            submenu,
+        let tray = TrayMenu {
+            inner: CTrayMenu {
+                text,
+                disabled: disabled as i32,
+                checked: checked as i32,
+                cb: Some(shim),
+                context: context as *mut c_void,
+                submenu: submenu,
+            },
         };
 
-        return Self { inner };
+        tray
+    }
+
+    /// Sets menu text.
+    pub fn set_text(&mut self, s: &str) {
+        if !self.inner.text.is_null() {
+            let _ = unsafe { CString::from_raw(self.inner.text) };
+        }
+        let text = CString::new(s).unwrap();
+        self.inner.text = text.into_raw();
+    }
+
+    /// Returns menu text.
+    pub fn text(&self) -> String {
+        unsafe {
+            CStr::from_ptr(self.inner.text)
+                .to_string_lossy()
+                .to_string()
+        }
     }
 
     /// Returns a menu with menu text, menu unchecked and enabled and a callback.
-    pub fn new<F: FnMut(&mut Self) + 'static>(text: &str, cb: F) -> Self {
-        Self::new_ex(text, false, false, cb, &[])
+    pub fn new<F: FnMut(&mut Tray, &mut TrayMenu) + 'static>(text: &str, cb: F) -> Self {
+        Self::new_ex(text, false, false, cb, Vec::<TrayMenu>::new())
+    }
+
+    /// Sets menu checked flag.
+    pub fn set_checked(&mut self, checked: bool) {
+        self.inner.checked = checked as i32;
+    }
+
+    /// Returns menu checked flag.
+    pub fn is_checked(&self) -> bool {
+        self.inner.checked != 0
+    }
+
+    /// Sets menu disabled (grayed) flag.
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.inner.disabled = disabled as i32;
+    }
+
+    /// Returns menu disabled (grayed) flag.
+    pub fn is_disabled(&self) -> bool {
+        self.inner.disabled != 0
+    }
+
+    pub(crate) fn null() -> TrayMenu {
+        unsafe { std::mem::zeroed() }
     }
 }
 
-/// Creates tray icon.
-pub fn tray_init(tray: &mut Tray) -> Result<(), i32> {
-    unsafe {
-        match rtray_sys::tray::tray_init(&mut tray.inner) {
-            -1 => Err(-1),
-            _ => Ok(()),
+impl Drop for TrayMenu {
+    fn drop(&mut self) {
+        if !self.inner.context.is_null() { // NONE MENU SHOULD NOT DROPPED.
+            let _ = unsafe { Rc::from_raw(self.inner.context as *const RefCell<TrayMenuContext>) };
         }
-    }
-}
-
-/// Updates tray icon and menu.
-pub fn tray_update(tray: &mut Tray) {
-    unsafe {
-        rtray_sys::tray::tray_update(&mut tray.inner);
     }
 }
 
