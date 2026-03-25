@@ -19,19 +19,24 @@ pub struct Tray {
 impl Tray {
     /// Returns a tray with an icon and a menu.
     ///
-    /// # Panics
-    ///
-    /// If one tray is already created.
-    pub fn new<T>(icon: &str, menus: T) -> Self
+    /// If the tray is already created, then return none.
+    pub fn new<T>(icon: &str, menus: T) -> Option<Self>
     where
         T: Into<Vec<TrayMenu>>,
     {
         if TRAY.load(Ordering::Relaxed) != std::ptr::null_mut() {
-            panic!("tray already created");
+            return None;
         }
-        Self {
-            inner: TrayInner::new(icon, menus) as *mut _,
+
+        let tray = TrayInner::new(icon, menus);
+        let tray = Box::into_raw(Box::new(tray));
+
+        TRAY.store(tray, Ordering::Relaxed);
+        unsafe {
+            rtray_sys::tray_init(&mut ((*tray).inner));
         }
+
+        Some(Self { inner: tray })
     }
 
     /// Updates tray icon and menu.
@@ -61,11 +66,12 @@ impl Drop for Tray {
 #[repr(C)]
 pub(crate) struct TrayInner {
     inner: CTray,
+    icon: CString,
     menu: Box<[TrayMenu]>,
 }
 
 impl TrayInner {
-    pub fn new<T>(icon: &str, menus: T) -> &'static mut Self
+    pub fn new<T>(icon: &str, menus: T) -> Self
     where
         T: Into<Vec<TrayMenu>>,
     {
@@ -76,27 +82,11 @@ impl TrayInner {
         let mut menu = menu.into_boxed_slice();
 
         let inner = CTray {
-            icon: icon.into_raw(),
+            icon: icon.as_ptr() as *mut c_char,
             menu: menu.as_mut_ptr() as *mut CTrayMenu,
         };
 
-        let tray = Self { inner, menu };
-        let tray = Box::into_raw(Box::new(tray));
-        TRAY.store(tray, Ordering::Relaxed);
-        let tray = unsafe { &mut *TRAY.load(Ordering::Relaxed) };
-        unsafe {
-            rtray_sys::tray_init(&mut tray.inner);
-        }
-
-        tray
-    }
-}
-
-impl Drop for TrayInner {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = Box::from_raw(self.inner.icon);
-        }
+        Self { inner, icon, menu }
     }
 }
 
@@ -148,8 +138,8 @@ impl Clone for TrayMenu {
 extern "C" fn shim(menu: *mut CTrayMenu) {
     let menu = unsafe { &mut *(menu as *mut TrayMenu) };
     let tray = unsafe { std::mem::transmute(&mut TRAY.load(Ordering::Relaxed)) };
-    let context = unsafe { &*(menu.inner.context as *const RefCell<TrayMenuContext>) };
-    if let Some(callback) = &mut context.borrow_mut().callback {
+    let context = unsafe { &mut *(menu.inner.context as *mut RefCell<TrayMenuContext>) };
+    if let Some(callback) = &mut context.get_mut().callback {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(tray, menu)));
     }
 }
@@ -186,11 +176,10 @@ impl TrayMenu {
 
     /// Sets menu text.
     pub fn set_text(&mut self, s: &str) {
-        if !self.inner.text.is_null() {
-            let _ = unsafe { CString::from_raw(self.inner.text) };
-        }
         let text = CString::new(s).unwrap();
-        self.inner.text = text.into_raw();
+        let context = unsafe { &*(self.inner.context as *const RefCell<TrayMenuContext>) };
+        self.inner.text = text.as_ptr() as _;
+        context.borrow_mut().text = text
     }
 
     /// Returns menu text.
@@ -234,7 +223,8 @@ impl TrayMenu {
 
 impl Drop for TrayMenu {
     fn drop(&mut self) {
-        if !self.inner.context.is_null() { // NONE MENU SHOULD NOT DROPPED.
+        if !self.inner.context.is_null() {
+            // NONE MENU SHOULD NOT DROPPED.
             let _ = unsafe { Rc::from_raw(self.inner.context as *const RefCell<TrayMenuContext>) };
         }
     }
