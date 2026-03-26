@@ -1,13 +1,41 @@
 use std::{
     cell::RefCell,
-    ffi::{c_char, c_void, CStr, CString},
+    ffi::{CStr, CString, c_char, c_void},
     rc::Rc,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
 use rtray_sys::{CTray, CTrayMenu};
 
 static TRAY: AtomicPtr<TrayInner> = AtomicPtr::new(std::ptr::null_mut());
+static TRAY_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Updates tray icon and menu.
+fn tray_update() {
+    let tray_ptr = TRAY.load(Ordering::Relaxed);
+    if tray_ptr != std::ptr::null_mut() {
+        unsafe {
+            let tray = &mut *tray_ptr;
+            rtray_sys::tray::tray_update(&mut tray.inner as *mut CTray);
+        }
+    }
+}
+
+/// Runs one iteration of the UI loop. Returns false if `exit()` has been called.
+pub fn tray_loop(blocking: bool) -> bool {
+    if TRAY.load(Ordering::Relaxed) == std::ptr::null_mut() {
+        panic!("Tray is not initialized.");
+    }
+
+    let blocking = if blocking { 1 } else { 0 };
+    unsafe { rtray_sys::tray::tray_loop(blocking) != -1 }
+}
+
+/// Terminates UI loop.
+pub fn tray_exit() {
+    unsafe { rtray_sys::tray::tray_exit() }
+    TRAY_INIT.store(false, Ordering::Relaxed);
+}
 
 /// A tray with an icon and a menu
 ///
@@ -17,49 +45,36 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// Returns a tray with an icon and a menu.
-    ///
-    /// If the tray is already created, then return none.
-    pub fn new<T>(icon: &str, menus: T) -> Option<Self>
+    /// Creates a tray with an icon and a menu.
+    /// 
+    /// # Panics
+    /// 
+    /// - If the tray is already initialized.
+    /// 
+    pub fn new<T>(icon: &str, menus: T) -> Self
     where
         T: Into<Vec<TrayMenu>>,
     {
-        if TRAY.load(Ordering::Relaxed) != std::ptr::null_mut() {
-            return None;
+        if TRAY_INIT.load(Ordering::Relaxed) {
+            panic!("Tray is already initialized.");
         }
-
         let tray = TrayInner::new(icon, menus);
         let tray = Box::into_raw(Box::new(tray));
 
         TRAY.store(tray, Ordering::Relaxed);
         unsafe {
-            rtray_sys::tray_init(&mut ((*tray).inner));
+            rtray_sys::tray_init(&mut (*tray).inner);
         }
-
-        Some(Self { inner: tray })
-    }
-
-    /// Updates tray icon and menu.
-    pub fn update(&mut self) {
-        unsafe {
-            let tray = &mut *self.inner;
-            rtray_sys::tray::tray_update(&mut tray.inner as *mut CTray); //TODO
-        }
+        TRAY_INIT.store(true, Ordering::Relaxed);
+        Self { inner: tray }
     }
 }
 
 impl Drop for Tray {
     fn drop(&mut self) {
-        unsafe {
-            if let Ok(_) = TRAY.compare_exchange(
-                self.inner,
-                std::ptr::null_mut(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                let _ = Box::from_raw(self.inner);
-            }
-        }
+        let _ = unsafe { Box::from_raw(self.inner) };
+        TRAY.store(std::ptr::null_mut(), Ordering::Relaxed);
+        TRAY_INIT.store(false, Ordering::Relaxed);
     }
 }
 
@@ -93,7 +108,7 @@ impl TrayInner {
 #[repr(C)]
 // #[derive(Clone)]
 struct TrayMenuContext {
-    callback: Option<Box<dyn FnMut(&mut Tray, &mut TrayMenu)>>,
+    callback: Option<Box<dyn FnMut(&mut TrayMenu)>>,
     submenu: Box<[TrayMenu]>,
     text: CString,
 }
@@ -101,7 +116,7 @@ struct TrayMenuContext {
 impl TrayMenuContext {
     fn new<I, T>(text: &str, callback: I, submenu: T) -> Self
     where
-        I: FnMut(&mut Tray, &mut TrayMenu) + 'static,
+        I: FnMut(&mut TrayMenu) + 'static,
         T: Into<Vec<TrayMenu>>,
     {
         let mut submenu: Vec<TrayMenu> = submenu.into();
@@ -137,10 +152,9 @@ impl Clone for TrayMenu {
 
 extern "C" fn shim(menu: *mut CTrayMenu) {
     let menu = unsafe { &mut *(menu as *mut TrayMenu) };
-    let tray = unsafe { std::mem::transmute(&mut TRAY.load(Ordering::Relaxed)) };
     let context = unsafe { &mut *(menu.inner.context as *mut RefCell<TrayMenuContext>) };
     if let Some(callback) = &mut context.get_mut().callback {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(tray, menu)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(menu)));
     }
 }
 
@@ -149,7 +163,7 @@ impl TrayMenu {
     pub fn new_ex<T, F>(text: &str, disabled: bool, checked: bool, callback: F, submenu: T) -> Self
     where
         T: Into<Vec<TrayMenu>>,
-        F: FnMut(&mut Tray, &mut TrayMenu) + 'static,
+        F: FnMut(&mut TrayMenu) + 'static,
     {
         let context = Rc::new(RefCell::new(TrayMenuContext::new(text, callback, submenu)));
         let submenu = if context.borrow().submenu.len() == 1 {
@@ -179,7 +193,9 @@ impl TrayMenu {
         let text = CString::new(s).unwrap();
         let context = unsafe { &*(self.inner.context as *const RefCell<TrayMenuContext>) };
         self.inner.text = text.as_ptr() as _;
-        context.borrow_mut().text = text
+        context.borrow_mut().text = text;
+
+        tray_update();
     }
 
     /// Returns menu text.
@@ -192,13 +208,15 @@ impl TrayMenu {
     }
 
     /// Returns a menu with menu text, menu unchecked and enabled and a callback.
-    pub fn new<F: FnMut(&mut Tray, &mut TrayMenu) + 'static>(text: &str, cb: F) -> Self {
+    pub fn new<F: FnMut(&mut TrayMenu) + 'static>(text: &str, cb: F) -> Self {
         Self::new_ex(text, false, false, cb, Vec::<TrayMenu>::new())
     }
 
     /// Sets menu checked flag.
     pub fn set_checked(&mut self, checked: bool) {
         self.inner.checked = checked as i32;
+
+        tray_update();
     }
 
     /// Returns menu checked flag.
@@ -209,6 +227,8 @@ impl TrayMenu {
     /// Sets menu disabled (grayed) flag.
     pub fn set_disabled(&mut self, disabled: bool) {
         self.inner.disabled = disabled as i32;
+
+        tray_update();
     }
 
     /// Returns menu disabled (grayed) flag.
@@ -228,15 +248,4 @@ impl Drop for TrayMenu {
             let _ = unsafe { Rc::from_raw(self.inner.context as *const RefCell<TrayMenuContext>) };
         }
     }
-}
-
-/// Runs one iteration of the UI loop. Returns false if `tray_exit()` has been called.
-pub fn tray_loop(blocking: bool) -> bool {
-    let blocking = if blocking { 1 } else { 0 };
-    unsafe { rtray_sys::tray::tray_loop(blocking) != -1 }
-}
-
-/// Terminates UI loop.
-pub fn tray_exit() {
-    unsafe { rtray_sys::tray::tray_exit() }
 }

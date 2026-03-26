@@ -1,24 +1,28 @@
-use rtray::{Tray, TrayMenu};
+use rtray::{tray_exit, tray_loop, Tray, TrayMenu};
 
 fn main() {
     let _tray = Tray::new(
         "icon.ico",
         &[
-            TrayMenu::new("Set checked!", |tray, menu| {
+            TrayMenu::new("Hello", |_| {
+                println!("Hello, rtray!");
+            }),
+            TrayMenu::new("Checked", |menu| {
                 menu.set_checked(!menu.is_checked());
-                tray.update();
             }),
-            TrayMenu::new("Set disabled!", |tray, menu| {
-                menu.set_disabled(!menu.is_disabled());
-                tray.update();
-            }),
-            TrayMenu::new("Set text!", |tray, menu| {
-                menu.set_text("New Text");
-                tray.update();
-            }),
-            TrayMenu::new("Exit", |_, _| rtray::tray_exit()),
+            TrayMenu::new_ex("Disabled", true, false, |_| {}, &[]),
+            TrayMenu::new("-", |_| {}),
+            TrayMenu::new_ex("Submenu", false, false, |_| {}, &[
+                TrayMenu::new("First", |menu| {
+                    println!("{} submenu clicked", menu.text());
+                }),
+                TrayMenu::new("Second", |menu| {
+                    println!("{} submenu clicked", menu.text());
+                }),
+            ]),
+            TrayMenu::new("Exit", |_| tray_exit()),
         ],
     );
 
-    while rtray::tray_loop(true) {}
+    while tray_loop(true) {}
 }
