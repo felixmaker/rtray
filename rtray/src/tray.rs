@@ -1,30 +1,38 @@
 use std::{
-    cell::RefCell,
-    ffi::{CStr, CString, c_char, c_void},
-    rc::Rc,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    cell::RefCell, ffi::{CStr, CString, c_char, c_void}, pin::Pin, rc::Rc, sync::atomic::{AtomicBool, AtomicPtr, Ordering}
 };
 
 use rtray_sys::{CTray, CTrayMenu};
 
-static TRAY: AtomicPtr<TrayInner> = AtomicPtr::new(std::ptr::null_mut());
+static TRAY: AtomicPtr<CTray> = AtomicPtr::new(std::ptr::null_mut());
 static TRAY_INIT: AtomicBool = AtomicBool::new(false);
 
 /// Updates tray icon and menu.
 fn tray_update() {
-    let tray_ptr = TRAY.load(Ordering::Relaxed);
-    if tray_ptr != std::ptr::null_mut() {
+    let tray = TRAY.load(Ordering::Relaxed);
+    if tray != std::ptr::null_mut() {
         unsafe {
-            let tray = &mut *tray_ptr;
-            rtray_sys::tray::tray_update(&mut tray.inner as *mut CTray);
+            rtray_sys::tray::tray_update(tray);
         }
     }
 }
 
+/// Loads a new tray.
+pub fn tray_load(menu: &mut Tray) {
+    TRAY.store(&mut *menu.inner.as_mut(), Ordering::Relaxed);
+    if !TRAY_INIT.load(Ordering::Relaxed) {
+        unsafe {
+            rtray_sys::tray_init(TRAY.load(Ordering::Relaxed));
+        }
+    }
+    TRAY_INIT.store(true, Ordering::Relaxed);
+    tray_update();
+}
+
 /// Runs one iteration of the UI loop. Returns false if `exit()` has been called.
 pub fn tray_loop(blocking: bool) -> bool {
-    if TRAY.load(Ordering::Relaxed) == std::ptr::null_mut() {
-        panic!("Tray is not initialized.");
+    if !TRAY_INIT.load(Ordering::Relaxed) {
+        return false
     }
 
     let blocking = if blocking { 1 } else { 0 };
@@ -34,58 +42,20 @@ pub fn tray_loop(blocking: bool) -> bool {
 /// Terminates UI loop.
 pub fn tray_exit() {
     unsafe { rtray_sys::tray::tray_exit() }
-    TRAY_INIT.store(false, Ordering::Relaxed);
 }
 
+#[repr(C)]
 /// A tray with an icon and a menu
-///
-/// Bindings to struct tray
 pub struct Tray {
-    inner: *mut TrayInner,
+    inner: Pin<Box<CTray>>,
+    icon: CString,
+    menu: Box<[TrayMenu]>,
 }
 
 impl Tray {
     /// Creates a tray with an icon and a menu.
     /// 
-    /// # Panics
-    /// 
-    /// - If the tray is already initialized.
-    /// 
-    pub fn new<T>(icon: &str, menus: T) -> Self
-    where
-        T: Into<Vec<TrayMenu>>,
-    {
-        if TRAY_INIT.load(Ordering::Relaxed) {
-            panic!("Tray is already initialized.");
-        }
-        let tray = TrayInner::new(icon, menus);
-        let tray = Box::into_raw(Box::new(tray));
-
-        TRAY.store(tray, Ordering::Relaxed);
-        unsafe {
-            rtray_sys::tray_init(&mut (*tray).inner);
-        }
-        TRAY_INIT.store(true, Ordering::Relaxed);
-        Self { inner: tray }
-    }
-}
-
-impl Drop for Tray {
-    fn drop(&mut self) {
-        let _ = unsafe { Box::from_raw(self.inner) };
-        TRAY.store(std::ptr::null_mut(), Ordering::Relaxed);
-        TRAY_INIT.store(false, Ordering::Relaxed);
-    }
-}
-
-#[repr(C)]
-pub(crate) struct TrayInner {
-    inner: CTray,
-    icon: CString,
-    menu: Box<[TrayMenu]>,
-}
-
-impl TrayInner {
+    /// If no tray is initialized, it will be initialized and loaded.
     pub fn new<T>(icon: &str, menus: T) -> Self
     where
         T: Into<Vec<TrayMenu>>,
@@ -101,7 +71,9 @@ impl TrayInner {
             menu: menu.as_mut_ptr() as *mut CTrayMenu,
         };
 
-        Self { inner, icon, menu }
+        let mut tray = Self { inner: Box::pin(inner), icon, menu };
+        tray_load(&mut tray);
+        tray
     }
 }
 
