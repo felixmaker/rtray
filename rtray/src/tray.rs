@@ -1,15 +1,20 @@
 use std::{
-    cell::RefCell, ffi::{CStr, CString, c_char, c_void}, pin::Pin, rc::Rc, sync::atomic::{AtomicBool, AtomicPtr, Ordering}
+    cell::{Cell, RefCell},
+    ffi::{c_char, c_void, CStr, CString},
+    pin::Pin,
+    rc::Rc,
 };
 
 use rtray_sys::{CTray, CTrayMenu};
 
-static TRAY: AtomicPtr<CTray> = AtomicPtr::new(std::ptr::null_mut());
-static TRAY_INIT: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static TRAY: Cell<*mut CTray> = Cell::new(std::ptr::null_mut());
+    static TRAY_INIT: Cell<bool> = Cell::new(false);
+}
 
 /// Updates tray icon and menu.
 fn tray_update() {
-    let tray = TRAY.load(Ordering::Relaxed);
+    let tray = TRAY.get();
     if tray != std::ptr::null_mut() {
         unsafe {
             rtray_sys::tray::tray_update(tray);
@@ -19,20 +24,20 @@ fn tray_update() {
 
 /// Loads a new tray.
 pub fn tray_load(menu: &mut Tray) {
-    TRAY.store(&mut *menu.inner.as_mut(), Ordering::Relaxed);
-    if !TRAY_INIT.load(Ordering::Relaxed) {
+    TRAY.set(&mut *menu.inner.as_mut());
+    if !TRAY_INIT.get() {
         unsafe {
-            rtray_sys::tray_init(TRAY.load(Ordering::Relaxed));
+            rtray_sys::tray_init(TRAY.get());
         }
     }
-    TRAY_INIT.store(true, Ordering::Relaxed);
+    TRAY_INIT.set(true);
     tray_update();
 }
 
 /// Runs one iteration of the UI loop. Returns false if `exit()` has been called.
 pub fn tray_loop(blocking: bool) -> bool {
-    if !TRAY_INIT.load(Ordering::Relaxed) {
-        return false
+    if !TRAY_INIT.get() {
+        return false;
     }
 
     let blocking = if blocking { 1 } else { 0 };
@@ -54,7 +59,7 @@ pub struct Tray {
 
 impl Tray {
     /// Creates a tray with an icon and a menu.
-    /// 
+    ///
     /// If no tray is initialized, it will be initialized and loaded.
     pub fn new<T>(icon: &str, menus: T) -> Self
     where
@@ -71,7 +76,11 @@ impl Tray {
             menu: menu.as_mut_ptr() as *mut CTrayMenu,
         };
 
-        let mut tray = Self { inner: Box::pin(inner), icon, menu };
+        let mut tray = Self {
+            inner: Box::pin(inner),
+            icon,
+            menu,
+        };
         tray_load(&mut tray);
         tray
     }
